@@ -239,6 +239,39 @@ _pthread_setspecific_static(pthread_key_t key, void *value)
 void*
 pthread_getspecific(pthread_key_t key)
 {
+	/* DAR-257 (2026-09-06): real bug, found while root-causing notifyd's
+	 * dispatch manager thread crashing with DISPATCH_INTERNAL_CRASH
+	 * "Invalid wlh" -- libdispatch's dispatch_wlh_key (a plain, dynamically
+	 * allocated pthread_key_t from pthread_key_create(), numbered well
+	 * above __pthread_tsd_start in every observed case, e.g. 268) was
+	 * correctly written by pthread_setspecific() -> _pthread_setspecific()
+	 * above, into thread->tsd[key] -- but this function unconditionally
+	 * read it back via _pthread_getspecific_direct(key), a TPIDRRO_EL0-
+	 * relative fast accessor that tsd_private.h's own real, unmodified
+	 * Apple header comment documents as "[t]o be used with static constant
+	 * keys only". For a dynamically allocated key that direct read does
+	 * not correspond to thread->tsd[key] at all in this project's
+	 * from-scratch TSD bootstrap (this port's TPIDRRO_EL0/thread->tsd[]
+	 * aliasing for newly pthread_create()'d threads is not guaranteed to
+	 * match real Apple hardware's kernel-established layout) -- so
+	 * pthread_getspecific() silently read unrelated memory instead of what
+	 * was actually stored, non-deterministically per-thread depending on
+	 * whatever else occupied that offset. Confirmed via a real QEMU boot
+	 * with a temporary probe (open()/write() to /var/log/dar257_probe.log,
+	 * added and reverted this session) printing the real pthread_key_t
+	 * values and the mismatched readback.
+	 *
+	 * Fix: mirror _pthread_setspecific()'s own key-range check immediately
+	 * above and read from the exact same thread->tsd[key] array it writes
+	 * for the dynamic-key range, so get/set are symmetric for every key
+	 * pthread_key_create() can hand out. The static/reserved range
+	 * (key < __pthread_tsd_start, e.g. __PTK_LIBDISPATCH_KEY0-9 when
+	 * DISPATCH_USE_DIRECT_TSD is active) keeps using the existing direct
+	 * accessor unchanged -- untouched by this fix, since it was never the
+	 * range implicated by the real crash data. */
+	if (key >= __pthread_tsd_start && key < __pthread_tsd_end) {
+		return pthread_self()->tsd[key];
+	}
 	return _pthread_getspecific_direct(key);
 }
 
